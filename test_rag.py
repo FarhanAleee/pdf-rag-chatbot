@@ -9,6 +9,8 @@ import fitz
 import numpy as np
 
 from rag import (
+    EMBEDDING_MODEL_NAME,
+    _get_embedding_model,
     chunk_text,
     extract_text_from_pdf,
     generate_answer,
@@ -47,6 +49,14 @@ class ExtractTextFromPdfTests(unittest.TestCase):
             ],
         )
 
+    def test_reports_extraction_progress_for_each_page(self) -> None:
+        pdf_path = self._create_pdf("progress.pdf", ["First page", "Second page"])
+        progress = []
+
+        extract_text_from_pdf(str(pdf_path), lambda current, total: progress.append((current, total)))
+
+        self.assertEqual(progress, [(1, 2), (2, 2)])
+
     def test_missing_pdf_raises_clear_value_error(self) -> None:
         missing_path = self.temp_path / "missing.pdf"
 
@@ -59,6 +69,19 @@ class ExtractTextFromPdfTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Unable to read PDF"):
             extract_text_from_pdf(str(invalid_path))
+
+    def test_embedding_model_is_reused_between_calls(self) -> None:
+        model_class = unittest.mock.Mock()
+        fake_module = SimpleNamespace(SentenceTransformer=model_class)
+        _get_embedding_model.clear()
+        self.addCleanup(_get_embedding_model.clear)
+
+        with patch.dict("sys.modules", {"sentence_transformers": fake_module}):
+            first_model = _get_embedding_model()
+            second_model = _get_embedding_model()
+
+        self.assertIs(first_model, second_model)
+        model_class.assert_called_once_with(EMBEDDING_MODEL_NAME)
 
     def test_pdf_without_extractable_text_raises_value_error(self) -> None:
         pdf_path = self._create_pdf("textless.pdf", [""])
@@ -248,18 +271,31 @@ class GenerateAnswerTests(unittest.TestCase):
 
         client_class.assert_not_called()
 
-    def test_api_failure_is_reported_without_exposing_secrets(self) -> None:
+    def test_api_failure_is_logged_safely_without_exposing_secrets(self) -> None:
         secret = "do-not-include-this-key"
+        prompt_text = "Question Context"
         with (
             patch.dict("os.environ", {"GEMINI_API_KEY": secret}),
             patch("rag.load_dotenv"),
-            patch("rag.genai.Client", side_effect=RuntimeError(secret)),
+            patch(
+                "rag.genai.Client",
+                side_effect=RuntimeError(
+                    f"HTTP 403 permission denied; api_key={secret}; request={prompt_text}"
+                ),
+            ),
+            self.assertLogs("rag", level="ERROR") as captured_logs,
         ):
             with self.assertRaisesRegex(RuntimeError, "Gemini API request failed") as error:
                 generate_answer("Question", ["Context"])
 
         self.assertNotIn(secret, str(error.exception))
         self.assertNotIn(secret, "".join(traceback.format_exception(error.exception)))
+        diagnostic = "\n".join(captured_logs.output)
+        self.assertIn("RuntimeError", diagnostic)
+        self.assertIn("HTTP 403 permission denied", diagnostic)
+        self.assertIn("[redacted]", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn(prompt_text, diagnostic)
 
     def test_empty_api_response_raises_clear_error(self) -> None:
         with (

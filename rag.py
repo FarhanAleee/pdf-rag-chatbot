@@ -1,19 +1,43 @@
-from functools import lru_cache
+import logging
 import os
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 
 import fitz
 import numpy as np
+import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=1)
+def _safe_gemini_error_message(
+	error: Exception,
+	api_key: str,
+	prompt: str,
+	sensitive_text: list[str],
+) -> str:
+	"""Remove credentials and document/query text from a Gemini error message."""
+	message = str(error)
+	for secret in (api_key, api_key.strip(), prompt, *sensitive_text):
+		if secret:
+			message = message.replace(secret, "[redacted]")
+	message = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[redacted]", message)
+	message = re.sub(r"(?i)Bearer\s+\S+", "Bearer [redacted]", message)
+	message = re.sub(
+		r"(?i)(api[_ -]?key|authorization)(\s*[:=]\s*)[^\s,;]+",
+		r"\1\2[redacted]",
+		message,
+	)
+	return message
+
+
+@st.cache_resource(show_spinner="Loading the embedding model. The first download can take longer...")
 def _get_embedding_model():
 	"""Load and reuse the sentence-transformers model on first use."""
 	from sentence_transformers import SentenceTransformer
@@ -32,21 +56,29 @@ def _get_chunk_text(chunk: str | dict[str, Any]) -> str:
 	return chunk["text"]
 
 
-def extract_text_from_pdf(pdf_path: str) -> list[dict]:
+def extract_text_from_pdf(
+	pdf_path: str,
+	progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict]:
 	"""Extract normalized text from each page of a PDF.
 
 	Each result includes a 1-based page number and that page's text with
-	runs of whitespace collapsed to single spaces.
+	runs of whitespace collapsed to single spaces. The optional callback receives
+	the current page number and total page count after each page is extracted.
 	"""
 	try:
 		with fitz.open(pdf_path) as pdf:
-			pages = [
-				{
-					"page_number": page_number,
-					"text": re.sub(r"\s+", " ", page.get_text("text")).strip(),
-				}
-				for page_number, page in enumerate(pdf, start=1)
-			]
+			total_pages = len(pdf)
+			pages = []
+			for page_number, page in enumerate(pdf, start=1):
+				pages.append(
+					{
+						"page_number": page_number,
+						"text": re.sub(r"\s+", " ", page.get_text("text")).strip(),
+					}
+				)
+				if progress_callback is not None:
+					progress_callback(page_number, total_pages)
 	except (OSError, RuntimeError, ValueError) as exc:
 		raise ValueError(f"Unable to read PDF {pdf_path!r}: {exc}") from exc
 
@@ -234,16 +266,39 @@ def generate_answer(
 		"Answer:"
 	)
 
+	logger.info("Gemini API request started.")
+	request_started = time.perf_counter()
 	try:
 		client = genai.Client(api_key=api_key)
 		response = client.models.generate_content(model=model_name, contents=prompt)
-	except Exception:
+		answer = response.text
+	except Exception as error:
+		request_duration = time.perf_counter() - request_started
+		safe_message = _safe_gemini_error_message(
+			error,
+			api_key,
+			prompt,
+			[question, *context_parts],
+		)
+		logger.error(
+			"Gemini API request failed after %.2f seconds (%s): %s",
+			request_duration,
+			type(error).__name__,
+			safe_message,
+		)
 		raise RuntimeError(
 			"Gemini API request failed. Check the API configuration and try again."
 		) from None
 
-	answer = response.text
 	if not isinstance(answer, str) or not answer.strip():
+		logger.error(
+			"Gemini API request completed in %.2f seconds but response contained no answer text.",
+			time.perf_counter() - request_started,
+		)
 		raise RuntimeError("Gemini returned an empty answer.")
 
+	logger.info(
+		"Gemini API request succeeded in %.2f seconds.",
+		time.perf_counter() - request_started,
+	)
 	return answer.strip()

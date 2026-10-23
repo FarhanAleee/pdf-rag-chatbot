@@ -1,0 +1,27 @@
+
+# Python virtual environment
+.venv/
+
+# Environment variables and API keys
+.env
+.env.*
+
+# Allow an example environment file
+!.env.example
+
+# Python cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Editor and operating system files
+.vscode/
+.DS_Store
