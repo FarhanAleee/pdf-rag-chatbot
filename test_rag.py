@@ -7,9 +7,11 @@ from unittest.mock import patch
 
 import fitz
 import numpy as np
+from google.genai.errors import APIError
 
 from rag import (
     EMBEDDING_MODEL_NAME,
+    GeminiUnavailableError,
     _get_embedding_model,
     chunk_text,
     extract_text_from_pdf,
@@ -224,7 +226,8 @@ class GenerateAnswerTests(unittest.TestCase):
 
         self.assertEqual(answer, "The document says 42.")
         load_dotenv.assert_called_once_with(override=False)
-        client_class.assert_called_once_with(api_key="test-key")
+        client_class.assert_called_once()
+        self.assertEqual(client_class.call_args.kwargs["api_key"], "test-key")
         call = client.models.generate_content.call_args.kwargs
         self.assertEqual(call["model"], "gemini-test")
         prompt = call["contents"]
@@ -235,6 +238,74 @@ class GenerateAnswerTests(unittest.TestCase):
         self.assertIn("Do not invent facts", prompt)
         self.assertIn("clearly say so", prompt)
         self.assertNotIn("Source page: 2", prompt)
+
+    def test_retries_503_with_exponential_backoff_then_succeeds(self) -> None:
+        with (
+            patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
+            patch("rag.load_dotenv"),
+            patch("rag.genai.Client") as client_class,
+            patch("rag.time.sleep") as sleep,
+        ):
+            client = client_class.return_value
+            client.models.generate_content.side_effect = [
+                APIError(503, {"status": "UNAVAILABLE"}),
+                APIError(503, {"status": "UNAVAILABLE"}),
+                SimpleNamespace(text="Recovered answer"),
+            ]
+
+            answer = generate_answer("Question?", ["Context."])
+
+        self.assertEqual(answer, "Recovered answer")
+        self.assertEqual(client.models.generate_content.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+        retry_options = client_class.call_args.kwargs["http_options"].retry_options
+        self.assertEqual(retry_options.attempts, 1)
+        self.assertEqual(retry_options.http_status_codes, [503])
+
+    def test_raises_clear_error_after_three_503_attempts(self) -> None:
+        with (
+            patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
+            patch("rag.load_dotenv"),
+            patch("rag.genai.Client") as client_class,
+            patch("rag.time.sleep") as sleep,
+        ):
+            client_class.return_value.models.generate_content.side_effect = APIError(
+                503,
+                {"status": "UNAVAILABLE", "message": "high demand"},
+            )
+
+            with self.assertRaisesRegex(
+                GeminiUnavailableError,
+                "temporarily unavailable \\(503\\) after 3 attempts",
+            ):
+                generate_answer("Question?", ["Context."])
+
+        self.assertEqual(
+            client_class.return_value.models.generate_content.call_count,
+            3,
+        )
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_does_not_retry_non_503_api_errors(self) -> None:
+        with (
+            patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
+            patch("rag.load_dotenv"),
+            patch("rag.genai.Client") as client_class,
+            patch("rag.time.sleep") as sleep,
+        ):
+            client_class.return_value.models.generate_content.side_effect = APIError(
+                401,
+                {"status": "UNAUTHENTICATED"},
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Gemini API request failed"):
+                generate_answer("Question?", ["Context."])
+
+        self.assertEqual(
+            client_class.return_value.models.generate_content.call_count,
+            1,
+        )
+        sleep.assert_not_called()
 
     def test_uses_default_model_when_environment_value_is_empty(self) -> None:
         with (

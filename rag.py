@@ -9,11 +9,19 @@ import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
+from google.genai.errors import APIError
+from google.genai.types import HttpOptions, HttpRetryOptions
 
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_503_MAX_ATTEMPTS = 3
+GEMINI_503_INITIAL_DELAY_SECONDS = 1
 logger = logging.getLogger(__name__)
+
+
+class GeminiUnavailableError(RuntimeError):
+	"""Raised when Gemini remains unavailable after bounded 503 retries."""
 
 
 def _safe_gemini_error_message(
@@ -269,9 +277,34 @@ def generate_answer(
 	logger.info("Gemini API request started.")
 	request_started = time.perf_counter()
 	try:
-		client = genai.Client(api_key=api_key)
-		response = client.models.generate_content(model=model_name, contents=prompt)
-		answer = response.text
+		client = genai.Client(
+			api_key=api_key,
+			http_options=HttpOptions(
+				retry_options=HttpRetryOptions(
+					attempts=1,
+					http_status_codes=[503],
+				)
+			),
+		)
+		for attempt in range(1, GEMINI_503_MAX_ATTEMPTS + 1):
+			try:
+				response = client.models.generate_content(
+					model=model_name,
+					contents=prompt,
+				)
+				answer = response.text
+				break
+			except APIError as error:
+				if error.code != 503 or attempt == GEMINI_503_MAX_ATTEMPTS:
+					raise
+				delay = GEMINI_503_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1))
+				logger.info(
+					"Gemini returned 503; retrying attempt %d of %d after %d seconds.",
+					attempt + 1,
+					GEMINI_503_MAX_ATTEMPTS,
+					delay,
+				)
+				time.sleep(delay)
 	except Exception as error:
 		request_duration = time.perf_counter() - request_started
 		safe_message = _safe_gemini_error_message(
@@ -286,6 +319,11 @@ def generate_answer(
 			type(error).__name__,
 			safe_message,
 		)
+		if isinstance(error, APIError) and error.code == 503:
+			raise GeminiUnavailableError(
+				"Gemini is temporarily unavailable (503) after 3 attempts. "
+				"Please try again shortly."
+			) from None
 		raise RuntimeError(
 			"Gemini API request failed. Check the API configuration and try again."
 		) from None
